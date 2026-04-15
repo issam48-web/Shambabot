@@ -1,24 +1,15 @@
 require('dotenv').config();
 const express = require('express');
-const AfricasTalking = require('africastalking');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Africa's Talking setup
-const AT = AfricasTalking({
-  apiKey: process.env.AT_API_KEY,
-  username: process.env.AT_USERNAME
-});
-const atWhatsapp = AT.WHATSAPP;
 
 // Claude AI setup
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Memory: store each farmer's conversation
+// Store each farmer's conversation history
 const conversations = new Map();
 
 const SYSTEM_PROMPT = `You are ShambaBot, a friendly AI farming assistant
@@ -33,47 +24,88 @@ for Kenyan farmers. Help with:
 Keep answers short and clear for WhatsApp. Support English and Swahili.
 Address farmers warmly as Mkulima when appropriate.`;
 
-// Health check — lets Railway know server is running
+// Health check
 app.get('/', (req, res) => res.send('🌿 ShambaBot is running!'));
 
-// Webhook — receives messages from Africa's Talking
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // always reply fast
+// Webhook verification — Meta requires this
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
 
-  const { from, text, mediaUrl } = req.body;
-  if (!from) return;
+  if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
+    console.log('Webhook verified!');
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
+
+// Receive messages from WhatsApp
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
 
   try {
-    // Get or start conversation for this farmer
+    const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return;
+
+    const entry = body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const message = changes?.value?.messages?.[0];
+
+    if (!message) return;
+
+    const from = message.from; // farmer's phone number
+    let userText = '';
+    let imageBase64 = null;
+
+    // Handle text message
+    if (message.type === 'text') {
+      userText = message.text.body;
+    }
+
+    // Handle image message
+    if (message.type === 'image') {
+      const imageId = message.image.id;
+      const caption = message.image.caption || '';
+
+      // Download image from Meta
+      const mediaRes = await axios.get(
+        `https://graph.facebook.com/v18.0/${imageId}`,
+        { headers: { Authorization: `Bearer ${process.env.META_ACCESS_TOKEN}` } }
+      );
+
+      const imageRes = await axios.get(mediaRes.data.url, {
+        headers: { Authorization: `Bearer ${process.env.META_ACCESS_TOKEN}` },
+        responseType: 'arraybuffer'
+      });
+
+      imageBase64 = Buffer.from(imageRes.data).toString('base64');
+      userText = caption || 'Analyse this crop photo. What disease or problem do you see? Give treatment using products available in Kenya.';
+    }
+
+    // Get or start conversation
     if (!conversations.has(from)) conversations.set(from, []);
     const history = conversations.get(from);
 
-    // Build the message (text or photo)
+    // Build message for Claude
     let userMessage;
-    if (mediaUrl) {
-      // Farmer sent a crop photo
-      const imgRes = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
-      const base64 = Buffer.from(imgRes.data).toString('base64');
+    if (imageBase64) {
       userMessage = {
         role: 'user',
         content: [
           {
             type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: base64 }
+            source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 }
           },
-          {
-            type: 'text',
-            text: text || 'Analyse this crop photo. What disease or problem do you see? Give a treatment plan using products available in Kenya.'
-          }
+          { type: 'text', text: userText }
         ]
       };
     } else {
-      userMessage = { role: 'user', content: text };
+      userMessage = { role: 'user', content: userText };
     }
 
     history.push(userMessage);
-
-    // Keep only last 10 messages to save memory
     if (history.length > 10) history.splice(0, history.length - 10);
 
     // Ask Claude AI
@@ -87,18 +119,24 @@ app.post('/webhook', async (req, res) => {
     const reply = response.content[0].text;
     history.push({ role: 'assistant', content: reply });
 
-    // Send reply to farmer on WhatsApp
-    await atWhatsapp.sendMessage({
-      to: from,
-      message: reply
-    });
+    // Send reply back to farmer via Meta WhatsApp API
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: from,
+        text: { body: reply }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.META_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
 
   } catch (err) {
     console.error('Error:', err.message);
-    await atWhatsapp.sendMessage({
-      to: from,
-      message: 'Samahani, kulikuwa na tatizo. Tafadhali jaribu tena.\n(Sorry, an error occurred. Please try again.)'
-    });
   }
 });
 
